@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import os
+import re
+from collections import defaultdict
+
+
+MAILDIR_SUBDIRS = ['cur', 'new', 'tmp']
+
+
+def strip_uid(subdir, old_name):
+  uid_pattern = re.compile(r'^U=(\d+)$')
+  parts = old_name.split(':')
+  for idx, part in enumerate(parts):
+    segments = []
+    for segment in part.split(','):
+      if not uid_pattern.match(segment):
+        segments.append(segment)
+    parts[idx] = ','.join(segments)
+  new_name = ':'.join(parts)
+  os.rename(os.path.join(subdir, old_name), os.path.join(subdir, new_name))
+
+
+def extract_uid(filename):
+
+  uid_pattern = re.compile(r'^U=(\d+)$')
+  parts = filename.split(':')
+  if len(parts) > 1:
+    flags = ':' + parts[-1]
+    parts = parts[:-1]
+  for part in parts:
+    for segment in part.split(','):
+      m = uid_pattern.match(segment)
+      if m:
+        return int(m[1])
+  return -1
+
+
+def repair_maildir(maildir, dry_run):
+
+  maildir_files = {}
+  duplicate_files = []
+  validity_file = os.path.join(maildir, '.uidvalidity')
+  if os.path.isfile(validity_file):
+    validity_contents = []
+    with open(validity_file) as infile:
+      validity_contents = infile.readlines()
+    max_uid = 0
+    if len(validity_contents) > 1:
+      max_uid = int(validity_contents[1])
+
+    for subdir in MAILDIR_SUBDIRS:
+      for entry in os.scandir(os.path.join(maildir, subdir)):
+        if entry.is_file():
+          if entry.name in maildir_files:
+            duplicate_files.append(entry.name)
+          else:
+            maildir_files[entry.name] = (subdir, extract_uid(entry.name), entry.stat().st_mtime_ns)
+    if len(duplicate_files) > 0:
+      print("Duplicate Filenames!")
+      exit(1)
+
+    maildir_uid = defaultdict(lambda: set())
+    for file, (subdir, uid, mtime) in maildir_files.items():
+      if uid >= 0:
+        maildir_uid[uid].add(file)
+
+    uids = maildir_uid.keys()
+    if len(uids) > 0:
+      max_key = max(maildir_uid.keys())
+      if  max_key > max_uid:
+        print("max exceeded in {0}".format(maildir))
+        if not dry_run:
+          # update the validity file to new max uid
+          validity_contents[1] = "{0}\n".format(max_key)
+          with open(validity_file, "w") as outfile:
+            for line in validity_contents:
+              print(line, file=outfile, end='')
+    
+    for uid, files in maildir_uid.items():
+      if len(files) > 1:
+        print("duplicate uid {0} in {1}".format(uid, maildir))
+        if not dry_run:
+          oldest = min([maildir_files[f][2] for f in files])
+          skipped = False
+          for file in files:
+            (subdir, uid, mtime) = maildir_files[file]
+            if mtime != oldest or skipped:
+              strip_uid(os.path.join(maildir, subdir), file)
+            else:
+              skipped = True
+
+
+def main(args):
+
+  ret_code = 0
+
+  # first identify all of the targeted maildirs
+  maildirs = []
+  for dir in args.dirs:
+    for root, dirs, files in os.walk(dir):
+      counter = 0
+      for dir in MAILDIR_SUBDIRS:
+        if dir in dirs:
+          counter += 1
+      if counter == len(MAILDIR_SUBDIRS):
+        maildirs.append(root)
+
+  for maildir in maildirs:
+    repair_maildir(maildir, args.dry_run)
+  
+  return ret_code
+
+
+if __name__ == "__main__":
+
+  parser = argparse.ArgumentParser(description="repairs one or more maildirs")
+  parser.add_argument("dirs", nargs='+', help="root directories to search for maildirs")
+  parser.add_argument("-n", "--dry-run", action='store_true', help="if specified, make no maildir changes")
+  args = parser.parse_args()
+  exit(main(args))
